@@ -2,20 +2,21 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
+	"time"
 )
 
 type message struct {
-	ID   string
-	Type string
-	Data string
+	ID        string
+	Type      string
+	Data      string
+	CreatedAt time.Time
 }
 
 var queue []message
 
-func publisher(rw http.ResponseWriter, req *http.Request) {
+func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 	if req.URL.Path != "/" || req.Method != "POST" {
 		http.Error(rw, "404 not found.", http.StatusNotFound)
 		return
@@ -32,16 +33,61 @@ func publisher(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
+	m.CreatedAt = time.Now().Local()
+
 	queue = append(queue, m)
 
 	log.Println(queue)
+	rw.WriteHeader(http.StatusCreated)
+}
+
+func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
+	if req.URL.Path != "/" || req.Method != "GET" {
+		http.Error(rw, "404 not found.", http.StatusNotFound)
+		return
+	}
+
+	if len(queue) < 1 {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusNoContent)
+		rw.Write([]byte(nil))
+		return
+	}
+
+	var currentItem message
+
+	currentItem, queue = queue[0], queue[1:]
+
+	currentItemJSON, err := json.Marshal(currentItem)
+	if err != nil {
+		panic(err)
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(http.StatusOK)
+	rw.Write(currentItemJSON)
 }
 
 func main() {
-	http.HandleFunc("/", publisher)
+	finish := make(chan bool)
 
-	fmt.Printf("Starting publisher server...\n")
-	if err := http.ListenAndServe(":9000", nil); err != nil {
-		log.Fatal(err)
-	}
+	publishersServer := http.NewServeMux()
+	publishersServer.HandleFunc("/", publishersHandler)
+
+	subscribersServer := http.NewServeMux()
+	subscribersServer.HandleFunc("/", subscribersHandler)
+
+	go func() {
+		if err := http.ListenAndServe(":8001", publishersServer); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	go func() {
+		if err := http.ListenAndServe(":8002", subscribersServer); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	<-finish
 }
