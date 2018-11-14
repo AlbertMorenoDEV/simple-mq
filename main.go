@@ -4,14 +4,13 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"time"
 )
 
 type message struct {
-	ID        string
-	Type      string
-	Data      string
-	CreatedAt time.Time
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	Data string `json:"data"`
+	// CreatedAt time.Time
 }
 
 var queue []message
@@ -22,23 +21,19 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	req.ParseForm()
-
 	var m message
-	for key := range req.Form {
 
-		err := json.Unmarshal([]byte(key), &m)
-		if err != nil {
-			log.Println(err.Error())
-		}
+	decoder := json.NewDecoder(req.Body)
+	err := decoder.Decode(&m)
+	if err != nil {
+		panic(err)
 	}
-
-	m.CreatedAt = time.Now().Local()
 
 	queue = append(queue, m)
 
-	log.Println(queue)
 	rw.WriteHeader(http.StatusCreated)
+
+	log.Printf("New message '%s'. Total '%d' messages in the queue", messageToJSON(m), len(queue))
 }
 
 func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
@@ -54,18 +49,26 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var currentItem message
+	var m message
 
-	currentItem, queue = queue[0], queue[1:]
+	m, queue = queue[0], queue[1:]
 
-	currentItemJSON, err := json.Marshal(currentItem)
-	if err != nil {
-		panic(err)
-	}
+	mJSON := messageToJSON(m)
 
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusOK)
-	rw.Write(currentItemJSON)
+	rw.Write(mJSON)
+
+	log.Printf("Message delivered '%s'. Total '%d' messages in the queue", mJSON, len(queue))
+}
+
+func messageToJSON(m message) []byte {
+	mJSON, err := json.Marshal(m)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return mJSON
 }
 
 func main() {
