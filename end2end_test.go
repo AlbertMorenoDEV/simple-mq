@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
+	"github.com/icrowley/fake"
+	uuid "github.com/satori/go.uuid"
 	"gopkg.in/h2non/baloo.v3"
 )
 
@@ -20,8 +23,8 @@ func TestInitialState(t *testing.T) {
 		Done()
 }
 
-func TestPublishMessage(t *testing.T) {
-	message := map[string]string{"id": "1", "type": "test", "data": "hello"}
+func TestPublishSingleMessage(t *testing.T) {
+	message := createRandomMessage()
 
 	publishersServerTest.Post("/").
 		JSON(message).
@@ -36,4 +39,15 @@ func TestPublishMessage(t *testing.T) {
 		Type("json").
 		JSON(message).
 		Done()
+}
+
+func createRandomMessage() map[string]string {
+	id := uuid.Must(uuid.NewV4()).String()
+	t := fake.Product()
+	d, _ := json.Marshal(map[string]string{
+		"name":      fake.FirstName(),
+		"full_name": fake.FullName(),
+	})
+
+	return map[string]string{"id": id, "type": t, "data": string(d)}
 }
