@@ -95,7 +95,7 @@ go get gopkg.in/h2non/baloo.v3
 
 ## ToDo
 
-- [ ] **Persistence**: Save queue items to disk to prevent data loss on restart.
+- [x] **Persistence**: Save queue items to disk to prevent data loss on restart.
 - [ ] **Multiple Subscribers**: Implement different delivery patterns (e.g., fan-out, round-robin).
 - [x] **Multiple Queues**: Support for multiple named queues.
 - [ ] **Socket Support**: Implement Socket-based publisher and subscriber for lower latency.

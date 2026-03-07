@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 )
@@ -14,11 +16,52 @@ type message struct {
 	Data string `json:"data"`
 }
 
+const persistenceFile = "queues.json"
+
 var (
 	// queues stores messages keyed by queue name
 	queues = make(map[string][]message)
 	mu     sync.Mutex
 )
+
+func init() {
+	loadQueues()
+}
+
+func loadQueues() {
+	if _, err := os.Stat(persistenceFile); os.IsNotExist(err) {
+		return
+	}
+
+	data, err := ioutil.ReadFile(persistenceFile)
+	if err != nil {
+		log.Printf("Error reading persistence file: %v", err)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if err := json.Unmarshal(data, &queues); err != nil {
+		log.Printf("Error unmarshaling persistence data: %v", err)
+		return
+	}
+	log.Printf("Loaded %d queues from persistence", len(queues))
+}
+
+func saveQueues() {
+	mu.Lock()
+	data, err := json.MarshalIndent(queues, "", "  ")
+	mu.Unlock()
+
+	if err != nil {
+		log.Printf("Error marshaling queues for persistence: %v", err)
+		return
+	}
+
+	if err := ioutil.WriteFile(persistenceFile, data, 0644); err != nil {
+		log.Printf("Error writing persistence file: %v", err)
+	}
+}
 
 func getQueueName(path string) string {
 	name := strings.TrimPrefix(path, "/")
@@ -48,6 +91,8 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 	currentLen := len(queues[queueName])
 	mu.Unlock()
 
+	saveQueues()
+
 	rw.WriteHeader(http.StatusCreated)
 
 	mJSON, _ := json.Marshal(m)
@@ -75,6 +120,8 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 	queues[queueName] = q[1:]
 	currentLen := len(queues[queueName])
 	mu.Unlock()
+
+	saveQueues()
 
 	mJSON, err := json.Marshal(m)
 	if err != nil {
