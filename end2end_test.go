@@ -42,7 +42,7 @@ func TestPublishSingleMessage(t *testing.T) {
 }
 
 func createRandomMessage() map[string]string {
-	id := uuid.Must(uuid.NewV4()).String()
+	id := uuid.NewV4().String()
 	t := fake.Product()
 	d, _ := json.Marshal(map[string]string{
 		"name":      fake.FirstName(),
