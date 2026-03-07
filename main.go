@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -14,15 +15,26 @@ type message struct {
 }
 
 var (
-	queue []message
-	mu    sync.Mutex
+	// queues stores messages keyed by queue name
+	queues = make(map[string][]message)
+	mu     sync.Mutex
 )
 
+func getQueueName(path string) string {
+	name := strings.TrimPrefix(path, "/")
+	if name == "" {
+		return "default"
+	}
+	return name
+}
+
 func publishersHandler(rw http.ResponseWriter, req *http.Request) {
-	if req.URL.Path != "/" || req.Method != "POST" {
+	if req.Method != "POST" {
 		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	queueName := getQueueName(req.URL.Path)
 
 	var m message
 	decoder := json.NewDecoder(req.Body)
@@ -32,33 +44,36 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	mu.Lock()
-	queue = append(queue, m)
-	currentLen := len(queue)
+	queues[queueName] = append(queues[queueName], m)
+	currentLen := len(queues[queueName])
 	mu.Unlock()
 
 	rw.WriteHeader(http.StatusCreated)
 
 	mJSON, _ := json.Marshal(m)
-	log.Printf("New message '%s'. Total '%d' messages in the queue", mJSON, currentLen)
+	log.Printf("[%s] New message '%s'. Total '%d' messages", queueName, mJSON, currentLen)
 }
 
 func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
-	if req.URL.Path != "/" || req.Method != "GET" {
+	if req.Method != "GET" {
 		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	queueName := getQueueName(req.URL.Path)
+
 	mu.Lock()
-	if len(queue) < 1 {
+	q, ok := queues[queueName]
+	if !ok || len(q) < 1 {
 		mu.Unlock()
 		rw.Header().Set("Content-Type", "application/json")
 		rw.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	m := queue[0]
-	queue = queue[1:]
-	currentLen := len(queue)
+	m := q[0]
+	queues[queueName] = q[1:]
+	currentLen := len(queues[queueName])
 	mu.Unlock()
 
 	mJSON, err := json.Marshal(m)
@@ -71,7 +86,7 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 	rw.WriteHeader(http.StatusOK)
 	rw.Write(mJSON)
 
-	log.Printf("Message delivered '%s'. Total '%d' messages in the queue", mJSON, currentLen)
+	log.Printf("[%s] Message delivered '%s'. Total '%d' messages", queueName, mJSON, currentLen)
 }
 
 func main() {

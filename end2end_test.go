@@ -41,6 +41,39 @@ func TestPublishSingleMessage(t *testing.T) {
 		Done()
 }
 
+func TestMultipleQueues(t *testing.T) {
+	msg1 := createRandomMessage()
+	msg2 := createRandomMessage()
+
+	// Publish msg1 to default queue
+	publishersServerTest.Post("/").
+		JSON(msg1).
+		Expect(t).
+		Status(http.StatusCreated).
+		Done()
+
+	// Publish msg2 to named queue 'tasks'
+	publishersServerTest.Post("/tasks").
+		JSON(msg2).
+		Expect(t).
+		Status(http.StatusCreated).
+		Done()
+
+	// Get from default queue
+	subscribersServerTest.Get("/").
+		Expect(t).
+		Status(http.StatusOK).
+		JSON(msg1).
+		Done()
+
+	// Get from 'tasks' queue
+	subscribersServerTest.Get("/tasks").
+		Expect(t).
+		Status(http.StatusOK).
+		JSON(msg2).
+		Done()
+}
+
 func createRandomMessage() map[string]string {
 	id := uuid.NewV4().String()
 	t := fake.Product()

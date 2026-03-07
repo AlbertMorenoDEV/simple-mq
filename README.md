@@ -97,7 +97,7 @@ go get gopkg.in/h2non/baloo.v3
 
 - [ ] **Persistence**: Save queue items to disk to prevent data loss on restart.
 - [ ] **Multiple Subscribers**: Implement different delivery patterns (e.g., fan-out, round-robin).
-- [ ] **Multiple Queues**: Support for multiple named queues.
+- [x] **Multiple Queues**: Support for multiple named queues.
 - [ ] **Socket Support**: Implement Socket-based publisher and subscriber for lower latency.
 - [ ] **Robustness**: Improve error handling, validation, and logging.
 
