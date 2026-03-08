@@ -275,7 +275,7 @@ func handleSocketSubscribe(conn net.Conn, queueName string) {
 		mu.Unlock()
 		saveQueues()
 		mJSON, _ := json.Marshal(m)
-		fmt.Fprintf(conn, string(mJSON)+"\n")
+		fmt.Fprintf(conn, "%s\n", string(mJSON))
 		log.Printf("[INFO][TCP][%s] Delivered message %s from queue", queueName, m.ID)
 		return
 	}
@@ -287,7 +287,7 @@ func handleSocketSubscribe(conn net.Conn, queueName string) {
 	select {
 	case m := <-ch:
 		mJSON, _ := json.Marshal(m)
-		fmt.Fprintf(conn, string(mJSON)+"\n")
+		fmt.Fprintf(conn, "%s\n", string(mJSON))
 		log.Printf("[INFO][TCP][%s] Delivered message %s (fan-out)", queueName, m.ID)
 	case <-time.After(30 * time.Second): // Optional timeout for socket sub
 		fmt.Fprintf(conn, `{"status": "timeout"}`+"\n")
