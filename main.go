@@ -19,6 +19,16 @@ type message struct {
 	Data string `json:"data"`
 }
 
+func (m message) Validate() error {
+	if m.ID == "" {
+		return fmt.Errorf("message id is required")
+	}
+	if m.Type == "" {
+		return fmt.Errorf("message type is required")
+	}
+	return nil
+}
+
 type socketAction struct {
 	Action string  `json:"action"` // "publish" or "subscribe"
 	Queue  string  `json:"queue"`
@@ -39,6 +49,7 @@ var (
 )
 
 func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	loadQueues()
 }
 
@@ -49,17 +60,17 @@ func loadQueues() {
 
 	data, err := ioutil.ReadFile(persistenceFile)
 	if err != nil {
-		log.Printf("Error reading persistence file: %v", err)
+		log.Printf("[ERROR] Reading persistence file: %v", err)
 		return
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	if err := json.Unmarshal(data, &queues); err != nil {
-		log.Printf("Error unmarshaling persistence data: %v", err)
+		log.Printf("[ERROR] Unmarshaling persistence data: %v", err)
 		return
 	}
-	log.Printf("Loaded %d queues from persistence", len(queues))
+	log.Printf("[INFO] Loaded %d queues from persistence", len(queues))
 }
 
 func saveQueues() {
@@ -68,17 +79,18 @@ func saveQueues() {
 	mu.Unlock()
 
 	if err != nil {
-		log.Printf("Error marshaling queues for persistence: %v", err)
+		log.Printf("[ERROR] Marshaling queues: %v", err)
 		return
 	}
 
 	if err := ioutil.WriteFile(persistenceFile, data, 0644); err != nil {
-		log.Printf("Error writing persistence file: %v", err)
+		log.Printf("[ERROR] Writing persistence file: %v", err)
 	}
 }
 
 func getQueueName(path string) string {
 	name := strings.TrimPrefix(path, "/")
+	name = strings.TrimSpace(name)
 	if name == "" {
 		return "default"
 	}
@@ -96,16 +108,21 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 	var m message
 	decoder := json.NewDecoder(req.Body)
 	if err := decoder.Decode(&m); err != nil {
+		log.Printf("[WARN] Invalid JSON from %s: %v", req.RemoteAddr, err)
 		http.Error(rw, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	if err := m.Validate(); err != nil {
+		log.Printf("[WARN] Validation failed from %s: %v", req.RemoteAddr, err)
+		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	handlePublish(queueName, m)
 
 	rw.WriteHeader(http.StatusCreated)
-
-	mJSON, _ := json.Marshal(m)
-	log.Printf("[HTTP][%s] New message '%s'", queueName, mJSON)
+	log.Printf("[INFO][HTTP][%s] Published message %s", queueName, m.ID)
 }
 
 func handlePublish(queueName string, m message) {
@@ -114,7 +131,12 @@ func handlePublish(queueName string, m message) {
 	subs := subscribers[queueName]
 	if len(subs) > 0 {
 		for _, ch := range subs {
-			ch <- m
+			// Non-blocking send to avoid hanging publisher if a sub is slow
+			select {
+			case ch <- m:
+			default:
+				log.Printf("[WARN][%s] Subscriber channel full, dropping message for one sub", queueName)
+			}
 		}
 		// Clear subscribers after delivery (one-shot delivery per poll)
 		subscribers[queueName] = nil
@@ -138,7 +160,6 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 	mu.Lock()
 	q, ok := queues[queueName]
 	if ok && len(q) > 0 {
-		// Pull from queue if messages exist
 		m := q[0]
 		queues[queueName] = q[1:]
 		currentLen := len(queues[queueName])
@@ -149,16 +170,18 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// No messages in queue, wait for a new one (Long Polling / Fan-out)
+	// No messages in queue, wait for a new one
 	ch := make(chan message, 1)
 	subscribers[queueName] = append(subscribers[queueName], ch)
 	mu.Unlock()
+
+	log.Printf("[INFO][HTTP][%s] Subscriber waiting (long polling)...", queueName)
 
 	select {
 	case m := <-ch:
 		deliverMessage(rw, m, queueName, 0)
 	case <-req.Context().Done():
-		// Client disconnected, cleanup channel
+		// Client disconnected
 		mu.Lock()
 		subs := subscribers[queueName]
 		for i, s := range subs {
@@ -168,12 +191,14 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 		mu.Unlock()
+		log.Printf("[INFO][HTTP][%s] Subscriber disconnected", queueName)
 	}
 }
 
 func deliverMessage(rw http.ResponseWriter, m message, queueName string, currentLen int) {
 	mJSON, err := json.Marshal(m)
 	if err != nil {
+		log.Printf("[ERROR] Marshaling message: %v", err)
 		http.Error(rw, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -182,20 +207,20 @@ func deliverMessage(rw http.ResponseWriter, m message, queueName string, current
 	rw.WriteHeader(http.StatusOK)
 	rw.Write(mJSON)
 
-	log.Printf("[HTTP][%s] Message delivered. Remaining in queue: %d", queueName, currentLen)
+	log.Printf("[INFO][HTTP][%s] Delivered message %s. Queue size: %d", queueName, m.ID, currentLen)
 }
 
 func startSocketServer() {
 	ln, err := net.Listen("tcp", tcpPort)
 	if err != nil {
-		log.Fatalf("Socket server failed: %v", err)
+		log.Fatalf("[FATAL] Socket server failed: %v", err)
 	}
-	log.Printf("Socket server starting on %s", tcpPort)
+	log.Printf("[INFO] Socket server listening on %s", tcpPort)
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("Socket accept error: %v", err)
+			log.Printf("[ERROR] Socket accept: %v", err)
 			continue
 		}
 		go handleSocketConn(conn)
@@ -204,22 +229,35 @@ func startSocketServer() {
 
 func handleSocketConn(conn net.Conn) {
 	defer conn.Close()
+	log.Printf("[INFO][TCP] New connection from %s", conn.RemoteAddr())
+
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		var action socketAction
 		if err := json.Unmarshal(scanner.Bytes(), &action); err != nil {
+			log.Printf("[WARN][TCP] Invalid JSON from %s: %v", conn.RemoteAddr(), err)
 			fmt.Fprintf(conn, `{"error": "Invalid JSON"}`+"\n")
 			continue
 		}
 
+		if action.Queue == "" {
+			action.Queue = "default"
+		}
+
 		switch action.Action {
 		case "publish":
+			if err := action.Msg.Validate(); err != nil {
+				fmt.Fprintf(conn, `{"error": "%s"}`+"\n", err.Error())
+				continue
+			}
 			handlePublish(action.Queue, action.Msg)
-			fmt.Fprintf(conn, `{"status": "published"}`+"\n")
+			fmt.Fprintf(conn, `{"status": "published", "id": "%s"}`+"\n", action.Msg.ID)
+			log.Printf("[INFO][TCP][%s] Published message %s", action.Queue, action.Msg.ID)
 
 		case "subscribe":
+			log.Printf("[INFO][TCP][%s] Subscriber waiting...", action.Queue)
 			handleSocketSubscribe(conn, action.Queue)
-			return // handleSocketSubscribe takes over the connection
+			return
 
 		default:
 			fmt.Fprintf(conn, `{"error": "Unknown action"}`+"\n")
@@ -237,6 +275,7 @@ func handleSocketSubscribe(conn net.Conn, queueName string) {
 		saveQueues()
 		mJSON, _ := json.Marshal(m)
 		fmt.Fprintf(conn, string(mJSON)+"\n")
+		log.Printf("[INFO][TCP][%s] Delivered message %s from queue", queueName, m.ID)
 		return
 	}
 
@@ -244,9 +283,14 @@ func handleSocketSubscribe(conn net.Conn, queueName string) {
 	subscribers[queueName] = append(subscribers[queueName], ch)
 	mu.Unlock()
 
-	m := <-ch
-	mJSON, _ := json.Marshal(m)
-	fmt.Fprintf(conn, string(mJSON)+"\n")
+	select {
+	case m := <-ch:
+		mJSON, _ := json.Marshal(m)
+		fmt.Fprintf(conn, string(mJSON)+"\n")
+		log.Printf("[INFO][TCP][%s] Delivered message %s (fan-out)", queueName, m.ID)
+	case <-time.After(30 * time.Second): // Optional timeout for socket sub
+		fmt.Fprintf(conn, `{"status": "timeout"}`+"\n")
+	}
 }
 
 func main() {
@@ -261,17 +305,17 @@ func main() {
 
 	go func() {
 		defer wg.Done()
-		log.Println("Publisher server starting on :8001")
+		log.Printf("[INFO] Publisher HTTP server starting on :8001")
 		if err := http.ListenAndServe(":8001", publishersServer); err != nil {
-			log.Fatalf("Publisher server failed: %v", err)
+			log.Fatalf("[FATAL] Publisher server: %v", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		log.Println("Subscriber server starting on :8002")
+		log.Printf("[INFO] Subscriber HTTP server starting on :8002")
 		if err := http.ListenAndServe(":8002", subscribersServer); err != nil {
-			log.Fatalf("Subscriber server failed: %v", err)
+			log.Fatalf("[FATAL] Subscriber server: %v", err)
 		}
 	}()
 
