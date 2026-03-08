@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -16,7 +19,16 @@ type message struct {
 	Data string `json:"data"`
 }
 
-const persistenceFile = "queues.json"
+type socketAction struct {
+	Action string  `json:"action"` // "publish" or "subscribe"
+	Queue  string  `json:"queue"`
+	Msg    message `json:"message,omitempty"`
+}
+
+const (
+	persistenceFile = "queues.json"
+	tcpPort         = ":8003"
+)
 
 var (
 	// queues stores messages keyed by queue name
@@ -88,6 +100,15 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	handlePublish(queueName, m)
+
+	rw.WriteHeader(http.StatusCreated)
+
+	mJSON, _ := json.Marshal(m)
+	log.Printf("[HTTP][%s] New message '%s'", queueName, mJSON)
+}
+
+func handlePublish(queueName string, m message) {
 	mu.Lock()
 	// Fan-out: Send to all active subscribers
 	subs := subscribers[queueName]
@@ -101,15 +122,9 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 		// If no active subscribers, queue the message
 		queues[queueName] = append(queues[queueName], m)
 	}
-	currentLen := len(queues[queueName])
 	mu.Unlock()
 
 	saveQueues()
-
-	rw.WriteHeader(http.StatusCreated)
-
-	mJSON, _ := json.Marshal(m)
-	log.Printf("[%s] New message '%s'. Total '%d' messages in queue", queueName, mJSON, currentLen)
 }
 
 func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
@@ -167,7 +182,71 @@ func deliverMessage(rw http.ResponseWriter, m message, queueName string, current
 	rw.WriteHeader(http.StatusOK)
 	rw.Write(mJSON)
 
-	log.Printf("[%s] Message delivered '%s'. Remaining in queue: %d", queueName, mJSON, currentLen)
+	log.Printf("[HTTP][%s] Message delivered. Remaining in queue: %d", queueName, currentLen)
+}
+
+func startSocketServer() {
+	ln, err := net.Listen("tcp", tcpPort)
+	if err != nil {
+		log.Fatalf("Socket server failed: %v", err)
+	}
+	log.Printf("Socket server starting on %s", tcpPort)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("Socket accept error: %v", err)
+			continue
+		}
+		go handleSocketConn(conn)
+	}
+}
+
+func handleSocketConn(conn net.Conn) {
+	defer conn.Close()
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		var action socketAction
+		if err := json.Unmarshal(scanner.Bytes(), &action); err != nil {
+			fmt.Fprintf(conn, `{"error": "Invalid JSON"}`+"\n")
+			continue
+		}
+
+		switch action.Action {
+		case "publish":
+			handlePublish(action.Queue, action.Msg)
+			fmt.Fprintf(conn, `{"status": "published"}`+"\n")
+
+		case "subscribe":
+			handleSocketSubscribe(conn, action.Queue)
+			return // handleSocketSubscribe takes over the connection
+
+		default:
+			fmt.Fprintf(conn, `{"error": "Unknown action"}`+"\n")
+		}
+	}
+}
+
+func handleSocketSubscribe(conn net.Conn, queueName string) {
+	mu.Lock()
+	q, ok := queues[queueName]
+	if ok && len(q) > 0 {
+		m := q[0]
+		queues[queueName] = q[1:]
+		mu.Unlock()
+		saveQueues()
+		mJSON, _ := json.Marshal(m)
+		fmt.Fprintf(conn, string(mJSON)+"\n")
+		return
+	}
+
+	ch := make(chan message, 1)
+	subscribers[queueName] = append(subscribers[queueName], ch)
+	mu.Unlock()
+
+	m := <-ch
+	mJSON, _ := json.Marshal(m)
+	fmt.Fprintf(conn, string(mJSON)+"\n")
 }
 
 func main() {
@@ -178,7 +257,7 @@ func main() {
 	subscribersServer.HandleFunc("/", subscribersHandler)
 
 	wg := sync.WaitGroup{}
-	wg.Add(2)
+	wg.Add(3)
 
 	go func() {
 		defer wg.Done()
@@ -194,6 +273,11 @@ func main() {
 		if err := http.ListenAndServe(":8002", subscribersServer); err != nil {
 			log.Fatalf("Subscriber server failed: %v", err)
 		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		startSocketServer()
 	}()
 
 	wg.Wait()

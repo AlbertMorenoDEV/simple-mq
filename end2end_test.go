@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/icrowley/fake"
 	uuid "github.com/satori/go.uuid"
@@ -72,6 +74,36 @@ func TestMultipleQueues(t *testing.T) {
 		Status(http.StatusOK).
 		JSON(msg2).
 		Done()
+}
+
+func TestFanOut(t *testing.T) {
+	msg := createRandomMessage()
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+
+	// Start two subscribers waiting for a message
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			subscribersServerTest.Get("/fanout").
+				Expect(t).
+				Status(http.StatusOK).
+				JSON(msg).
+				Done()
+		}()
+	}
+
+	// Give subscribers time to connect
+	time.Sleep(500 * time.Millisecond)
+
+	// Publish one message
+	publishersServerTest.Post("/fanout").
+		JSON(msg).
+		Expect(t).
+		Status(http.StatusCreated).
+		Done()
+
+	wg.Wait()
 }
 
 func createRandomMessage() map[string]string {

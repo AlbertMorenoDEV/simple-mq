@@ -1,14 +1,16 @@
 # Simple MQ
 
-Simple MQ is a lightweight, in-memory message queue written in Go. It provides a straightforward HTTP interface for publishing and consuming messages via separate ports for publishers and subscribers.
+Simple MQ is a lightweight, in-memory message queue written in Go. It provides a straightforward HTTP interface and a high-performance TCP socket interface for publishing and consuming messages.
 
 ## Features
 
 - **HTTP API**: Simple REST-like interface for all operations.
-- **Port Separation**: Distinct ports for publishing (8001) and subscribing (8002) to avoid traffic congestion and simplify security.
+- **Socket Support**: TCP server on port 8003 for low-latency messaging.
+- **Port Separation**: Distinct ports for publishing (8001) and subscribing (8002).
 - **FIFO Delivery**: Messages are consumed in the same order they were published.
-- **JSON Support**: Native handling of JSON message payloads.
-- **Minimal Dependencies**: The core server is built using only the Go standard library.
+- **Fan-out Support**: Active subscribers receive messages immediately (Long Polling / Push).
+- **Persistence**: Messages are saved to disk to survive restarts.
+- **Multiple Queues**: Support for named queues via URL paths or JSON payloads.
 
 ## Prerequisites
 
@@ -28,8 +30,9 @@ Simple MQ is a lightweight, in-memory message queue written in Go. It provides a
    ```
 
 The server will start listening on:
-- **Publisher Port**: `8001`
-- **Subscriber Port**: `8002`
+- **Publisher Port (HTTP)**: `8001`
+- **Subscriber Port (HTTP)**: `8002`
+- **Socket Port (TCP)**: `8003`
 
 ## Usage
 
@@ -45,27 +48,42 @@ All messages should follow this JSON structure:
 }
 ```
 
-### Publish a Message
+### HTTP API
 
-To add a message to the queue, send a `POST` request to the publisher port:
+#### Publish a Message
 
 ```bash
 curl --header "Content-Type: application/json" \
   --request POST \
   --data '{"id":"1","type":"test","data":"hello"}' \
-  http://localhost:8001/
+  http://localhost:8001/my-queue
 ```
 
-### Consume a Message
-
-To retrieve and remove the next message from the queue, send a `GET` request to the subscriber port:
+#### Consume a Message
 
 ```bash
-curl http://localhost:8002/
+curl http://localhost:8002/my-queue
 ```
 
-- **Success (200 OK)**: Returns the oldest message in the queue.
-- **Queue Empty (204 No Content)**: If there are no messages to deliver.
+### TCP Socket API
+
+The TCP server on port `8003` accepts JSON-per-line.
+
+#### Publish via Socket
+
+Send a JSON object with `action: "publish"`:
+
+```json
+{"action": "publish", "queue": "tasks", "message": {"id": "1", "type": "test", "data": "socket-msg"}}
+```
+
+#### Subscribe via Socket
+
+Send a JSON object with `action: "subscribe"`:
+
+```json
+{"action": "subscribe", "queue": "tasks"}
+```
 
 ## Testing
 
@@ -76,17 +94,16 @@ This project uses [baloo](https://github.com/h2non/baloo) for end-to-end testing
 1. Ensure the server is running in one terminal (`go run main.go`).
 2. Run the tests in another terminal:
    ```bash
-   go test -v end2end_test.go
+   go test -v .
    ```
 
-*Note: You may need to install the test dependencies first:*
-```bash
-go get github.com/icrowley/fake
-go get github.com/satori/go.uuid
-go get gopkg.in/h2non/baloo.v3
-```
-
 ## Changelog
+
+### v0.2 (Work in Progress)
+- Added TCP Socket support.
+- Implemented Fan-out / Long Polling.
+- Added Data Persistence.
+- Support for Multiple Named Queues.
 
 ### v0.1
 - HTTP Publisher with a single message support.
@@ -96,9 +113,9 @@ go get gopkg.in/h2non/baloo.v3
 ## ToDo
 
 - [x] **Persistence**: Save queue items to disk to prevent data loss on restart.
-- [ ] **Multiple Subscribers**: Implement different delivery patterns (e.g., fan-out, round-robin).
+- [x] **Multiple Subscribers**: Implement different delivery patterns (e.g., fan-out, round-robin).
 - [x] **Multiple Queues**: Support for multiple named queues.
-- [ ] **Socket Support**: Implement Socket-based publisher and subscriber for lower latency.
+- [x] **Socket Support**: Implement Socket-based publisher and subscriber for lower latency.
 - [ ] **Robustness**: Improve error handling, validation, and logging.
 
 ## License
