@@ -14,7 +14,7 @@ Simple MQ is a lightweight, in-memory message queue written in Go. It provides a
 
 ## Prerequisites
 
-- [Go](https://golang.org/dl/) (1.11+ recommended)
+- [Go](https://golang.org/dl/) (1.25+ recommended)
 
 ## Installation & Running
 
