@@ -21,7 +21,9 @@ const persistenceFile = "queues.json"
 var (
 	// queues stores messages keyed by queue name
 	queues = make(map[string][]message)
-	mu     sync.Mutex
+	// subscribers stores active channels for fan-out delivery
+	subscribers = make(map[string][]chan message)
+	mu          sync.Mutex
 )
 
 func init() {
@@ -87,7 +89,18 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	mu.Lock()
-	queues[queueName] = append(queues[queueName], m)
+	// Fan-out: Send to all active subscribers
+	subs := subscribers[queueName]
+	if len(subs) > 0 {
+		for _, ch := range subs {
+			ch <- m
+		}
+		// Clear subscribers after delivery (one-shot delivery per poll)
+		subscribers[queueName] = nil
+	} else {
+		// If no active subscribers, queue the message
+		queues[queueName] = append(queues[queueName], m)
+	}
 	currentLen := len(queues[queueName])
 	mu.Unlock()
 
@@ -96,7 +109,7 @@ func publishersHandler(rw http.ResponseWriter, req *http.Request) {
 	rw.WriteHeader(http.StatusCreated)
 
 	mJSON, _ := json.Marshal(m)
-	log.Printf("[%s] New message '%s'. Total '%d' messages", queueName, mJSON, currentLen)
+	log.Printf("[%s] New message '%s'. Total '%d' messages in queue", queueName, mJSON, currentLen)
 }
 
 func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
@@ -109,20 +122,41 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 
 	mu.Lock()
 	q, ok := queues[queueName]
-	if !ok || len(q) < 1 {
+	if ok && len(q) > 0 {
+		// Pull from queue if messages exist
+		m := q[0]
+		queues[queueName] = q[1:]
+		currentLen := len(queues[queueName])
 		mu.Unlock()
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusNoContent)
+
+		saveQueues()
+		deliverMessage(rw, m, queueName, currentLen)
 		return
 	}
 
-	m := q[0]
-	queues[queueName] = q[1:]
-	currentLen := len(queues[queueName])
+	// No messages in queue, wait for a new one (Long Polling / Fan-out)
+	ch := make(chan message, 1)
+	subscribers[queueName] = append(subscribers[queueName], ch)
 	mu.Unlock()
 
-	saveQueues()
+	select {
+	case m := <-ch:
+		deliverMessage(rw, m, queueName, 0)
+	case <-req.Context().Done():
+		// Client disconnected, cleanup channel
+		mu.Lock()
+		subs := subscribers[queueName]
+		for i, s := range subs {
+			if s == ch {
+				subscribers[queueName] = append(subs[:i], subs[i+1:]...)
+				break
+			}
+		}
+		mu.Unlock()
+	}
+}
 
+func deliverMessage(rw http.ResponseWriter, m message, queueName string, currentLen int) {
 	mJSON, err := json.Marshal(m)
 	if err != nil {
 		http.Error(rw, "Internal server error", http.StatusInternalServerError)
@@ -133,7 +167,7 @@ func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
 	rw.WriteHeader(http.StatusOK)
 	rw.Write(mJSON)
 
-	log.Printf("[%s] Message delivered '%s'. Total '%d' messages", queueName, mJSON, currentLen)
+	log.Printf("[%s] Message delivered '%s'. Remaining in queue: %d", queueName, mJSON, currentLen)
 }
 
 func main() {
