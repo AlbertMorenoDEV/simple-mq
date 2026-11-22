@@ -2,14 +2,11 @@ package main
 
 import (
 	"net/http"
-	"os"
 	"testing"
 )
 
 func TestPersistence(t *testing.T) {
-	// Clean up before test
-	os.Remove(persistenceFile)
-	defer os.Remove(persistenceFile)
+	resetState(t)
 
 	msg := createRandomMessage()
 
