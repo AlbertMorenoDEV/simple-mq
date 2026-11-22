@@ -17,4 +17,7 @@
 # Project specific
 debug.test
 queues.json
+queues.json.wal
+*.wal
+*.tmp
 simple-mq

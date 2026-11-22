@@ -1,328 +1,173 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
-	"log"
-	"net"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/AlbertMorenoDEV/simple-mq/internal/broker"
+	"github.com/AlbertMorenoDEV/simple-mq/internal/config"
+	"github.com/AlbertMorenoDEV/simple-mq/internal/storage"
+	httptransport "github.com/AlbertMorenoDEV/simple-mq/internal/transport/http"
+	tcptransport "github.com/AlbertMorenoDEV/simple-mq/internal/transport/tcp"
 )
-
-type message struct {
-	ID   string `json:"id"`
-	Type string `json:"type"`
-	Data string `json:"data"`
-}
-
-func (m message) Validate() error {
-	if m.ID == "" {
-		return fmt.Errorf("message id is required")
-	}
-	if m.Type == "" {
-		return fmt.Errorf("message type is required")
-	}
-	return nil
-}
-
-type socketAction struct {
-	Action string  `json:"action"` // "publish" or "subscribe"
-	Queue  string  `json:"queue"`
-	Msg    message `json:"message,omitempty"`
-}
-
-const (
-	persistenceFile = "queues.json"
-	tcpPort         = ":8003"
-)
-
-var (
-	// queues stores messages keyed by queue name
-	queues = make(map[string][]message)
-	// subscribers stores active channels for fan-out delivery
-	subscribers = make(map[string][]chan message)
-	mu          sync.Mutex
-)
-
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	loadQueues()
-}
-
-func loadQueues() {
-	if _, err := os.Stat(persistenceFile); os.IsNotExist(err) {
-		return
-	}
-
-	data, err := os.ReadFile(persistenceFile)
-	if err != nil {
-		log.Printf("[ERROR] Reading persistence file: %v", err)
-		return
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if err := json.Unmarshal(data, &queues); err != nil {
-		log.Printf("[ERROR] Unmarshaling persistence data: %v", err)
-		return
-	}
-	log.Printf("[INFO] Loaded %d queues from persistence", len(queues))
-}
-
-func saveQueues() {
-	mu.Lock()
-	data, err := json.MarshalIndent(queues, "", "  ")
-	mu.Unlock()
-
-	if err != nil {
-		log.Printf("[ERROR] Marshaling queues: %v", err)
-		return
-	}
-
-	if err := os.WriteFile(persistenceFile, data, 0644); err != nil {
-		log.Printf("[ERROR] Writing persistence file: %v", err)
-	}
-}
-
-func getQueueName(path string) string {
-	name := strings.TrimPrefix(path, "/")
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "default"
-	}
-	return name
-}
-
-func publishersHandler(rw http.ResponseWriter, req *http.Request) {
-	if req.Method != "POST" {
-		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	queueName := getQueueName(req.URL.Path)
-
-	var m message
-	decoder := json.NewDecoder(req.Body)
-	if err := decoder.Decode(&m); err != nil {
-		log.Printf("[WARN] Invalid JSON from %s: %v", req.RemoteAddr, err)
-		http.Error(rw, "Invalid JSON payload", http.StatusBadRequest)
-		return
-	}
-
-	if err := m.Validate(); err != nil {
-		log.Printf("[WARN] Validation failed from %s: %v", req.RemoteAddr, err)
-		http.Error(rw, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	handlePublish(queueName, m)
-
-	rw.WriteHeader(http.StatusCreated)
-	log.Printf("[INFO][HTTP][%s] Published message %s", queueName, m.ID)
-}
-
-func handlePublish(queueName string, m message) {
-	mu.Lock()
-	// Fan-out: Send to all active subscribers
-	subs := subscribers[queueName]
-	if len(subs) > 0 {
-		for _, ch := range subs {
-			// Non-blocking send to avoid hanging publisher if a sub is slow
-			select {
-			case ch <- m:
-			default:
-				log.Printf("[WARN][%s] Subscriber channel full, dropping message for one sub", queueName)
-			}
-		}
-		// Clear subscribers after delivery (one-shot delivery per poll)
-		subscribers[queueName] = nil
-	} else {
-		// If no active subscribers, queue the message
-		queues[queueName] = append(queues[queueName], m)
-	}
-	mu.Unlock()
-
-	saveQueues()
-}
-
-func subscribersHandler(rw http.ResponseWriter, req *http.Request) {
-	if req.Method != "GET" {
-		http.Error(rw, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	queueName := getQueueName(req.URL.Path)
-
-	mu.Lock()
-	q, ok := queues[queueName]
-	if ok && len(q) > 0 {
-		m := q[0]
-		queues[queueName] = q[1:]
-		currentLen := len(queues[queueName])
-		mu.Unlock()
-
-		saveQueues()
-		deliverMessage(rw, m, queueName, currentLen)
-		return
-	}
-
-	// No messages in queue, wait for a new one
-	ch := make(chan message, 1)
-	subscribers[queueName] = append(subscribers[queueName], ch)
-	mu.Unlock()
-
-	log.Printf("[INFO][HTTP][%s] Subscriber waiting (long polling)...", queueName)
-
-	select {
-	case m := <-ch:
-		deliverMessage(rw, m, queueName, 0)
-	case <-req.Context().Done():
-		// Client disconnected
-		mu.Lock()
-		subs := subscribers[queueName]
-		for i, s := range subs {
-			if s == ch {
-				subscribers[queueName] = append(subs[:i], subs[i+1:]...)
-				break
-			}
-		}
-		mu.Unlock()
-		log.Printf("[INFO][HTTP][%s] Subscriber disconnected", queueName)
-	}
-}
-
-func deliverMessage(rw http.ResponseWriter, m message, queueName string, currentLen int) {
-	mJSON, err := json.Marshal(m)
-	if err != nil {
-		log.Printf("[ERROR] Marshaling message: %v", err)
-		http.Error(rw, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(http.StatusOK)
-	rw.Write(mJSON)
-
-	log.Printf("[INFO][HTTP][%s] Delivered message %s. Queue size: %d", queueName, m.ID, currentLen)
-}
-
-func startSocketServer() {
-	ln, err := net.Listen("tcp", tcpPort)
-	if err != nil {
-		log.Fatalf("[FATAL] Socket server failed: %v", err)
-	}
-	log.Printf("[INFO] Socket server listening on %s", tcpPort)
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Printf("[ERROR] Socket accept: %v", err)
-			continue
-		}
-		go handleSocketConn(conn)
-	}
-}
-
-func handleSocketConn(conn net.Conn) {
-	defer conn.Close()
-	log.Printf("[INFO][TCP] New connection from %s", conn.RemoteAddr())
-
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		var action socketAction
-		if err := json.Unmarshal(scanner.Bytes(), &action); err != nil {
-			log.Printf("[WARN][TCP] Invalid JSON from %s: %v", conn.RemoteAddr(), err)
-			fmt.Fprintf(conn, `{"error": "Invalid JSON"}`+"\n")
-			continue
-		}
-
-		if action.Queue == "" {
-			action.Queue = "default"
-		}
-
-		switch action.Action {
-		case "publish":
-			if err := action.Msg.Validate(); err != nil {
-				fmt.Fprintf(conn, `{"error": "%s"}`+"\n", err.Error())
-				continue
-			}
-			handlePublish(action.Queue, action.Msg)
-			fmt.Fprintf(conn, `{"status": "published", "id": "%s"}`+"\n", action.Msg.ID)
-			log.Printf("[INFO][TCP][%s] Published message %s", action.Queue, action.Msg.ID)
-
-		case "subscribe":
-			log.Printf("[INFO][TCP][%s] Subscriber waiting...", action.Queue)
-			handleSocketSubscribe(conn, action.Queue)
-			return
-
-		default:
-			fmt.Fprintf(conn, `{"error": "Unknown action"}`+"\n")
-		}
-	}
-}
-
-func handleSocketSubscribe(conn net.Conn, queueName string) {
-	mu.Lock()
-	q, ok := queues[queueName]
-	if ok && len(q) > 0 {
-		m := q[0]
-		queues[queueName] = q[1:]
-		mu.Unlock()
-		saveQueues()
-		mJSON, _ := json.Marshal(m)
-		fmt.Fprintf(conn, "%s\n", string(mJSON))
-		log.Printf("[INFO][TCP][%s] Delivered message %s from queue", queueName, m.ID)
-		return
-	}
-
-	ch := make(chan message, 1)
-	subscribers[queueName] = append(subscribers[queueName], ch)
-	mu.Unlock()
-
-	select {
-	case m := <-ch:
-		mJSON, _ := json.Marshal(m)
-		fmt.Fprintf(conn, "%s\n", string(mJSON))
-		log.Printf("[INFO][TCP][%s] Delivered message %s (fan-out)", queueName, m.ID)
-	case <-time.After(30 * time.Second): // Optional timeout for socket sub
-		fmt.Fprintf(conn, `{"status": "timeout"}`+"\n")
-	}
-}
 
 func main() {
-	publishersServer := http.NewServeMux()
-	publishersServer.HandleFunc("/", publishersHandler)
+	cfg, err := config.Load(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		os.Exit(2)
+	}
 
-	subscribersServer := http.NewServeMux()
-	subscribersServer.HandleFunc("/", subscribersHandler)
+	logger := buildLogger(cfg.LogLevel, cfg.LogFormat)
+	slog.SetDefault(logger)
 
-	wg := sync.WaitGroup{}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, cfg, logger); err != nil {
+		logger.Error("server exited with error", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+	store, err := buildStore(cfg)
+	if err != nil {
+		return fmt.Errorf("init storage: %w", err)
+	}
+
+	mode, err := broker.ParseDeliveryMode(cfg.DeliveryMode, broker.ModeHybrid)
+	if err != nil {
+		return err
+	}
+
+	b, err := broker.New(broker.Options{
+		DeliveryMode:      mode,
+		MaxQueueDepth:     cfg.MaxQueueDepth,
+		MaxQueues:         cfg.MaxQueues,
+		VisibilityTimeout: cfg.VisibilityTimeout,
+		MaxRetries:        cfg.MaxRetries,
+	}, store, logger)
+	if err != nil {
+		return fmt.Errorf("init broker: %w", err)
+	}
+
+	httpOpts := httptransport.Options{
+		MaxBodyBytes:       cfg.MaxMessageBytes,
+		DefaultPollTimeout: cfg.DefaultPollTimeout,
+		AuthToken:          cfg.AuthToken,
+		Logger:             logger,
+	}
+	pubSrv := httptransport.NewHTTPServer(cfg.PubAddr, httptransport.NewPublisherHandler(b, httpOpts))
+	subSrv := httptransport.NewHTTPServer(cfg.SubAddr, httptransport.NewSubscriberHandler(b, httpOpts))
+	tcpSrv := tcptransport.NewServer(b, tcptransport.Options{
+		MaxMessageBytes:    cfg.MaxMessageBytes,
+		DefaultPollTimeout: cfg.DefaultPollTimeout,
+		IdleTimeout:        cfg.TCPIdleTimeout,
+		AuthToken:          cfg.AuthToken,
+		Logger:             logger,
+	})
+
+	errCh := make(chan error, 3)
+	var wg sync.WaitGroup
+
 	wg.Add(3)
-
 	go func() {
 		defer wg.Done()
-		log.Printf("[INFO] Publisher HTTP server starting on :8001")
-		if err := http.ListenAndServe(":8001", publishersServer); err != nil {
-			log.Fatalf("[FATAL] Publisher server: %v", err)
+		logger.Info("publisher HTTP server starting", "addr", cfg.PubAddr)
+		if err := pubSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("publisher server: %w", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		log.Printf("[INFO] Subscriber HTTP server starting on :8002")
-		if err := http.ListenAndServe(":8002", subscribersServer); err != nil {
-			log.Fatalf("[FATAL] Subscriber server: %v", err)
+		logger.Info("subscriber HTTP server starting", "addr", cfg.SubAddr)
+		if err := subSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("subscriber server: %w", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		startSocketServer()
+		if err := tcpSrv.ListenAndServe(cfg.TCPAddr); err != nil {
+			errCh <- fmt.Errorf("tcp server: %w", err)
+		}
 	}()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, draining servers...")
+	case err := <-errCh:
+		runErr = err
+		logger.Error("fatal listener error, initiating shutdown", "err", err)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := pubSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("publisher server shutdown error", "err", err)
+	}
+	if err := subSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("subscriber server shutdown error", "err", err)
+	}
+	if err := tcpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("tcp server shutdown error", "err", err)
+	}
 
 	wg.Wait()
+
+	if err := b.Close(); err != nil {
+		logger.Error("broker close error", "err", err)
+		if runErr == nil {
+			runErr = err
+		}
+	}
+
+	logger.Info("simple-mq stopped cleanly")
+	return runErr
+}
+
+func buildStore(cfg config.Config) (storage.Store, error) {
+	switch strings.ToLower(cfg.StoreType) {
+	case "wal":
+		return storage.NewWALStore(cfg.DataFile, cfg.WALCompactEvery)
+	case "json":
+		return storage.NewJSONStore(cfg.DataFile), nil
+	case "memory":
+		return storage.NewMemoryStore(), nil
+	default:
+		return nil, fmt.Errorf("unsupported store type %q", cfg.StoreType)
+	}
+}
+
+func buildLogger(levelStr, format string) *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	if strings.ToLower(format) == "json" {
+		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
+	}
+	return slog.New(slog.NewTextHandler(os.Stdout, opts))
 }
