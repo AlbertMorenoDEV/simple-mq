@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -12,20 +16,77 @@ import (
 	"gopkg.in/h2non/baloo.v3"
 )
 
-var publishersServerTest = baloo.New("http://localhost:8001")
-var subscribersServerTest = baloo.New("http://localhost:8002")
+var (
+	publishersServerTest  *baloo.Client
+	subscribersServerTest *baloo.Client
+	subscribersServerURL  string
+)
+
+func TestMain(m *testing.M) {
+	pubServer := httptest.NewServer(http.HandlerFunc(publishersHandler))
+	subServer := httptest.NewServer(http.HandlerFunc(subscribersHandler))
+
+	publishersServerTest = baloo.New(pubServer.URL)
+	subscribersServerTest = baloo.New(subServer.URL)
+	subscribersServerURL = subServer.URL
+
+	code := m.Run()
+
+	pubServer.Close()
+	subServer.Close()
+	_ = os.Remove(persistenceFile)
+	os.Exit(code)
+}
+
+func resetState(t *testing.T) {
+	t.Helper()
+	mu.Lock()
+	queues = make(map[string][]message)
+	subscribers = make(map[string][]chan message)
+	mu.Unlock()
+	_ = os.Remove(persistenceFile)
+	t.Cleanup(func() {
+		_ = os.Remove(persistenceFile)
+	})
+}
 
 func TestInitialState(t *testing.T) {
-	subscribersServerTest.Get("/").
-		Expect(t).
-		Status(http.StatusNoContent).
-		Header("Content-Type", "application/json").
-		Type("json").
-		JSON(nil).
-		Done()
+	resetState(t)
+
+	// On an empty queue, subscribersHandler long-polls until a message arrives
+	// or the client disconnects.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subscribersServerURL+"/", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected long-polling request to time out with DeadlineExceeded, got err=%v", err)
+	}
+
+	// Verify the disconnected subscriber is cleaned up.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		remaining := len(subscribers["default"])
+		mu.Unlock()
+		if remaining == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected subscriber to be removed after disconnect")
 }
 
 func TestPublishSingleMessage(t *testing.T) {
+	resetState(t)
 	message := createRandomMessage()
 
 	publishersServerTest.Post("/").
@@ -44,6 +105,7 @@ func TestPublishSingleMessage(t *testing.T) {
 }
 
 func TestMultipleQueues(t *testing.T) {
+	resetState(t)
 	msg1 := createRandomMessage()
 	msg2 := createRandomMessage()
 
@@ -77,6 +139,7 @@ func TestMultipleQueues(t *testing.T) {
 }
 
 func TestFanOut(t *testing.T) {
+	resetState(t)
 	msg := createRandomMessage()
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -85,7 +148,7 @@ func TestFanOut(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			defer wg.Done()
-			subscribersServerTest.Get("/fanout").
+			baloo.New(subscribersServerURL).Get("/fanout").
 				Expect(t).
 				Status(http.StatusOK).
 				JSON(msg).
@@ -93,8 +156,17 @@ func TestFanOut(t *testing.T) {
 		}()
 	}
 
-	// Give subscribers time to connect
-	time.Sleep(500 * time.Millisecond)
+	// Wait until both subscribers are registered
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(subscribers["fanout"])
+		mu.Unlock()
+		if n == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Publish one message
 	publishersServerTest.Post("/fanout").

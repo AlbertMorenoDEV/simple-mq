@@ -91,11 +91,11 @@ This project uses [baloo](https://github.com/h2non/baloo) for end-to-end testing
 
 ### Running Tests
 
-1. Ensure the server is running in one terminal (`go run main.go`).
-2. Run the tests in another terminal:
-   ```bash
-   go test -v .
-   ```
+The test suite starts in-process test servers automatically:
+
+```bash
+go test -v ./...
+```
 
 ## Changelog
 
