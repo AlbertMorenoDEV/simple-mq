@@ -1,64 +1,99 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/icrowley/fake"
-	"gopkg.in/h2non/baloo.v3"
+	"github.com/AlbertMorenoDEV/simple-mq/internal/broker"
+	"github.com/AlbertMorenoDEV/simple-mq/internal/model"
+	"github.com/AlbertMorenoDEV/simple-mq/internal/storage"
+	httptransport "github.com/AlbertMorenoDEV/simple-mq/internal/transport/http"
 )
 
-var (
-	publishersServerTest  *baloo.Client
-	subscribersServerTest *baloo.Client
-	subscribersServerURL  string
-)
-
-func TestMain(m *testing.M) {
-	pubServer := httptest.NewServer(http.HandlerFunc(publishersHandler))
-	subServer := httptest.NewServer(http.HandlerFunc(subscribersHandler))
-
-	publishersServerTest = baloo.New(pubServer.URL)
-	subscribersServerTest = baloo.New(subServer.URL)
-	subscribersServerURL = subServer.URL
-
-	code := m.Run()
-
-	pubServer.Close()
-	subServer.Close()
-	_ = os.Remove(persistenceFile)
-	os.Exit(code)
+type testEnv struct {
+	broker *broker.Broker
+	pubSrv *httptest.Server
+	subSrv *httptest.Server
 }
 
-func resetState(t *testing.T) {
+func newTestEnv(t *testing.T, store storage.Store) *testEnv {
 	t.Helper()
-	mu.Lock()
-	queues = make(map[string][]message)
-	subscribers = make(map[string][]chan message)
-	mu.Unlock()
-	_ = os.Remove(persistenceFile)
+	b, err := broker.New(broker.DefaultOptions(), store, nil)
+	if err != nil {
+		t.Fatalf("new broker: %v", err)
+	}
+	opts := httptransport.Options{
+		DefaultPollTimeout: 5 * time.Second,
+	}
+	pub := httptest.NewServer(httptransport.NewPublisherHandler(b, opts))
+	sub := httptest.NewServer(httptransport.NewSubscriberHandler(b, opts))
 	t.Cleanup(func() {
-		_ = os.Remove(persistenceFile)
+		pub.Close()
+		sub.Close()
+		_ = b.Close()
 	})
+	return &testEnv{broker: b, pubSrv: pub, subSrv: sub}
+}
+
+func createSampleMessage() model.Message {
+	return model.Message{
+		ID:   model.NewUUID(),
+		Type: "order.created",
+		Data: json.RawMessage(`"hello simple-mq"`),
+	}
+}
+
+func postMessage(t *testing.T, baseURL, path string, msg model.Message) {
+	t.Helper()
+	body, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal msg: %v", err)
+	}
+	resp, err := http.Post(baseURL+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST %s: expected 201, got %d", path, resp.StatusCode)
+	}
+}
+
+func getMessage(t *testing.T, baseURL, path string) model.Message {
+	t.Helper()
+	resp, err := http.Get(baseURL + path)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s: expected 200, got %d", path, resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("GET %s: expected application/json, got %q", path, ct)
+	}
+	var m model.Message
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	return m
 }
 
 func TestInitialState(t *testing.T) {
-	resetState(t)
+	env := newTestEnv(t, storage.NewMemoryStore())
 
-	// On an empty queue, subscribersHandler long-polls until a message arrives
-	// or the client disconnects.
+	// On an empty queue, long-polling waits until a message arrives or the client cancels.
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subscribersServerURL+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, env.subSrv.URL+"/", nil)
 	if err != nil {
 		t.Fatalf("failed to create request: %v", err)
 	}
@@ -71,13 +106,10 @@ func TestInitialState(t *testing.T) {
 		t.Fatalf("expected long-polling request to time out with DeadlineExceeded, got err=%v", err)
 	}
 
-	// Verify the disconnected subscriber is cleaned up.
+	// Verify the disconnected subscriber is cleaned up promptly.
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		mu.Lock()
-		remaining := len(subscribers["default"])
-		mu.Unlock()
-		if remaining == 0 {
+		if env.broker.ActiveSubscriberCount("default") == 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -86,105 +118,68 @@ func TestInitialState(t *testing.T) {
 }
 
 func TestPublishSingleMessage(t *testing.T) {
-	resetState(t)
-	message := createRandomMessage()
+	env := newTestEnv(t, storage.NewMemoryStore())
+	want := createSampleMessage()
 
-	publishersServerTest.Post("/").
-		JSON(message).
-		Expect(t).
-		Status(http.StatusCreated).
-		Done()
+	postMessage(t, env.pubSrv.URL, "/", want)
+	got := getMessage(t, env.subSrv.URL, "/")
 
-	subscribersServerTest.Get("/").
-		Expect(t).
-		Status(http.StatusOK).
-		Header("Content-Type", "application/json").
-		Type("json").
-		JSON(message).
-		Done()
+	if got.ID != want.ID || got.Type != want.Type || string(got.Data) != string(want.Data) {
+		t.Fatalf("mismatch: want %+v, got %+v", want, got)
+	}
 }
 
 func TestMultipleQueues(t *testing.T) {
-	resetState(t)
-	msg1 := createRandomMessage()
-	msg2 := createRandomMessage()
+	env := newTestEnv(t, storage.NewMemoryStore())
+	msg1 := createSampleMessage()
+	msg2 := createSampleMessage()
 
-	// Publish msg1 to default queue
-	publishersServerTest.Post("/").
-		JSON(msg1).
-		Expect(t).
-		Status(http.StatusCreated).
-		Done()
+	postMessage(t, env.pubSrv.URL, "/", msg1)
+	postMessage(t, env.pubSrv.URL, "/tasks", msg2)
 
-	// Publish msg2 to named queue 'tasks'
-	publishersServerTest.Post("/tasks").
-		JSON(msg2).
-		Expect(t).
-		Status(http.StatusCreated).
-		Done()
+	got1 := getMessage(t, env.subSrv.URL, "/")
+	got2 := getMessage(t, env.subSrv.URL, "/tasks")
 
-	// Get from default queue
-	subscribersServerTest.Get("/").
-		Expect(t).
-		Status(http.StatusOK).
-		JSON(msg1).
-		Done()
-
-	// Get from 'tasks' queue
-	subscribersServerTest.Get("/tasks").
-		Expect(t).
-		Status(http.StatusOK).
-		JSON(msg2).
-		Done()
+	if got1.ID != msg1.ID {
+		t.Fatalf("default queue mismatch: want %s, got %s", msg1.ID, got1.ID)
+	}
+	if got2.ID != msg2.ID {
+		t.Fatalf("tasks queue mismatch: want %s, got %s", msg2.ID, got2.ID)
+	}
 }
 
 func TestFanOut(t *testing.T) {
-	resetState(t)
-	msg := createRandomMessage()
-	wg := sync.WaitGroup{}
+	env := newTestEnv(t, storage.NewMemoryStore())
+	want := createSampleMessage()
+
+	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Start two subscribers waiting for a message
+	results := make(chan model.Message, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
 			defer wg.Done()
-			baloo.New(subscribersServerURL).Get("/fanout").
-				Expect(t).
-				Status(http.StatusOK).
-				JSON(msg).
-				Done()
+			results <- getMessage(t, env.subSrv.URL, "/fanout")
 		}()
 	}
 
-	// Wait until both subscribers are registered
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		n := len(subscribers["fanout"])
-		mu.Unlock()
-		if n == 2 {
-			break
-		}
+	for time.Now().Before(deadline) && env.broker.ActiveSubscriberCount("fanout") < 2 {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Publish one message
-	publishersServerTest.Post("/fanout").
-		JSON(msg).
-		Expect(t).
-		Status(http.StatusCreated).
-		Done()
-
+	postMessage(t, env.pubSrv.URL, "/fanout", want)
 	wg.Wait()
-}
+	close(results)
 
-func createRandomMessage() map[string]string {
-	id := uuid.NewString()
-	t := fake.Product()
-	d, _ := json.Marshal(map[string]string{
-		"name":      fake.FirstName(),
-		"full_name": fake.FullName(),
-	})
-
-	return map[string]string{"id": id, "type": t, "data": string(d)}
+	count := 0
+	for got := range results {
+		count++
+		if got.ID != want.ID {
+			t.Fatalf("fan-out subscriber received wrong ID: want %s, got %s", want.ID, got.ID)
+		}
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 fan-out deliveries, got %d", count)
+	}
 }
