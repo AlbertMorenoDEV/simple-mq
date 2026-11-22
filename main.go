@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -59,7 +58,7 @@ func loadQueues() {
 		return
 	}
 
-	data, err := ioutil.ReadFile(persistenceFile)
+	data, err := os.ReadFile(persistenceFile)
 	if err != nil {
 		log.Printf("[ERROR] Reading persistence file: %v", err)
 		return
@@ -84,7 +83,7 @@ func saveQueues() {
 		return
 	}
 
-	if err := ioutil.WriteFile(persistenceFile, data, 0644); err != nil {
+	if err := os.WriteFile(persistenceFile, data, 0644); err != nil {
 		log.Printf("[ERROR] Writing persistence file: %v", err)
 	}
 }

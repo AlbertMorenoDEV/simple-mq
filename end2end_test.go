@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/icrowley/fake"
-	uuid "github.com/satori/go.uuid"
 	"gopkg.in/h2non/baloo.v3"
 )
 
@@ -107,7 +107,7 @@ func TestFanOut(t *testing.T) {
 }
 
 func createRandomMessage() map[string]string {
-	id := uuid.NewV4().String()
+	id := uuid.NewString()
 	t := fake.Product()
 	d, _ := json.Marshal(map[string]string{
 		"name":      fake.FirstName(),
